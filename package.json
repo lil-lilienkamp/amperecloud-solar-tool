@@ -1,0 +1,19 @@
+{
+  "name": "amperecloud-solar-tool",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.0.1"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "leaflet": "^1.9.4",
+    "plotly.js-dist-min": "^3.4.0"
+  }
+}
