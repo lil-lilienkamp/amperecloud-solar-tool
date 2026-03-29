@@ -4,7 +4,12 @@ import 'leaflet/dist/leaflet.css'
 import Plotly from 'plotly.js-dist-min'
 import JSZip from 'jszip'
 import { stations } from './stations'
-
+import {
+  getDayOfYear,
+  getNumberOfDaysInYear,
+  getSunPosition,
+  getTiltedGlobalIrradiance,
+} from './solarMath'
 // DWD source for hourly solar station metadata. The Vite dev proxy maps /dwd to opendata.dwd.de.
 const DWD_STATION_METADATA_URL =
   '/dwd/climate_environment/CDC/observations_germany/climate/hourly/solar/ST_Stundenwerte_Beschreibung_Stationen.txt'
@@ -20,8 +25,14 @@ const DEFAULT_LOCATION = {
 let dwdStations = []
 let marker = null
 let latestMonthlySeries = []
+let latestTiltedMonthlySeries = []
 let latestHourlyRecords = []
 let latestStationName = ''
+let latestSelectedLocation = {
+  lat: DEFAULT_LOCATION.lat,
+  lon: DEFAULT_LOCATION.lon,
+  label: DEFAULT_LOCATION.name,
+}
 
 document.querySelector('#app').innerHTML = `
   <div class="app">
@@ -114,11 +125,6 @@ document.querySelector('#app').innerHTML = `
 
         <button id="back-button" class="primary-button">Zurück zur Karte</button>
       </div>
-
-        <p>Hier bauen wir als Nächstes Azimut, Neigung und Ertragsberechnung ein.</p>
-
-        <button id="back-button" class="primary-button">Zurück zur Karte</button>
-      </div>
     </div>
   </div>
 `
@@ -186,8 +192,16 @@ function updateYieldEstimation() {
   const estimatedYieldPercent = orientationFactor * 100
 
   orientationFactorEl.textContent = orientationFactor.toFixed(2)
-  estimatedYieldEl.textContent = `${estimatedYieldPercent.toFixed(1)} %`
-}
+
+  if (latestTiltedMonthlySeries.length > 0) {
+    const annualTiltedYield = latestTiltedMonthlySeries.reduce(
+      (sum, entry) => sum + entry.irradiationKwhPerM2,
+      0
+    )
+    estimatedYieldEl.textContent = `${annualTiltedYield.toFixed(1)} kWh/m²`
+  } else {
+    estimatedYieldEl.textContent = `${estimatedYieldPercent.toFixed(1)} %`
+  }}
 
 // Calculate the great-circle distance between two coordinates in kilometers.
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
@@ -242,6 +256,11 @@ async function updateLocationAndChart(lat, lng, locationLabel = null) {
   const stationSource = dwdStations.length > 0 ? dwdStations : stations
   const nearestStation = findNearestStation(lat, lng, stationSource)
   const zipUrl = buildDwdSolarZipUrl(nearestStation.stationId)
+  latestSelectedLocation = {
+    lat,
+    lon: lng,
+    label: locationLabel ?? `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
+  }
 
   console.log('DWD ZIP URL:', zipUrl)
   console.log('Nächste Station:', nearestStation)
@@ -316,13 +335,7 @@ function parseDwdTimestamp(timestamp) {
   return { year, month, day, hour }
 }
 
-function getDayOfYear(year, month, day) {
-  const startOfYear = new Date(year, 0, 1)
-  const currentDate = new Date(year, month - 1, day)
-  const diffMs = currentDate - startOfYear
 
-  return Math.floor(diffMs / (1000 * 60 * 60 * 24)) + 1
-}
 
 function getFirstUsableHourlyRecord(records) {
   for (const record of records) {
@@ -339,6 +352,76 @@ function getFirstUsableHourlyRecord(records) {
   }
 
   return null
+}
+
+function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, surfaceTilt) {
+  const monthlySums = new Map()
+  const numberOfDaysInYear = getNumberOfDaysInYear(year)
+
+  for (const rawRecord of records) {
+    const record = normalizeHourlySolarRecord(rawRecord)
+
+    if (
+      !record.timestamp ||
+      record.globalHorizontal === null ||
+      record.diffuseHorizontal === null
+    ) {
+      continue
+    }
+
+    const parsedTimestamp = parseDwdTimestamp(record.timestamp)
+
+    if (parsedTimestamp.year !== year) {
+      continue
+    }
+
+    const dayOfYear = getDayOfYear(
+      parsedTimestamp.year,
+      parsedTimestamp.month,
+      parsedTimestamp.day
+    )
+
+    const sunPosition = getSunPosition({
+      longitude: location.lon,
+      latitude: location.lat,
+      dayOfYear,
+      timeZone: 1,
+      localTime: parsedTimestamp.hour,
+      numberOfDaysInYear,
+    })
+
+    if (!sunPosition || sunPosition.sunElevation <= 0) {
+      continue
+    }
+
+    const tiltedIrradiance = getTiltedGlobalIrradiance({
+      globalHorizontal: record.globalHorizontal,
+      diffuseHorizontal: record.diffuseHorizontal,
+      surfaceAzimuth,
+      surfaceTilt,
+      sunAzimuth: sunPosition.sunAzimuth,
+      sunElevation: sunPosition.sunElevation,
+      albedo: 0.2,
+    })
+
+    const monthKey = String(parsedTimestamp.month).padStart(2, '0')
+
+    if (!monthlySums.has(monthKey)) {
+      monthlySums.set(monthKey, 0)
+    }
+
+    monthlySums.set(monthKey, monthlySums.get(monthKey) + tiltedIrradiance.globalTilted)
+  }
+
+  return ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12'].map(
+    (month) => ({
+      year: String(year),
+      month,
+      label: `${year}-${month}`,
+      irradiationJPerCm2: monthlySums.get(month) ?? 0,
+      irradiationKwhPerM2: (monthlySums.get(month) ?? 0) / 360,
+    })
+  )
 }
 
 // Aggregate hourly global irradiation values into monthly sums.
@@ -550,12 +633,47 @@ async function testDwdZipFetch(zipUrl, stationName) {
     const dayOfYear = parsedTimestamp
       ? getDayOfYear(parsedTimestamp.year, parsedTimestamp.month, parsedTimestamp.day)
       : null
-    
+    const sunPosition = parsedTimestamp
+      ? getSunPosition({
+          longitude: latestSelectedLocation.lon,
+          latitude: latestSelectedLocation.lat,
+          dayOfYear,
+          timeZone: 1,
+          localTime: parsedTimestamp.hour,
+        })
+      : null
+    const tiltedIrradiance = firstUsableRecord && sunPosition
+      ? getTiltedGlobalIrradiance({
+          globalHorizontal: firstUsableRecord.globalHorizontal,
+          diffuseHorizontal: firstUsableRecord.diffuseHorizontal,
+          surfaceAzimuth: Number(azimuthSliderEl.value),
+          surfaceTilt: Number(tiltSliderEl.value),
+          sunAzimuth: sunPosition.sunAzimuth,
+          sunElevation: sunPosition.sunElevation,
+          albedo: 0.2,
+        })
+      : null
+    const selectedComparisonYear = latestMonthlySeries.length > 0
+      ? Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
+      : new Date().getFullYear()
+
+    latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
+      parsedRecords,
+      selectedComparisonYear,
+      latestSelectedLocation,
+      Number(azimuthSliderEl.value),
+      Number(tiltSliderEl.value)
+    )
+    console.log('Aktueller Berechnungsstandort:', latestSelectedLocation)
     console.log('Erster brauchbarer stündlicher Datensatz:', firstUsableRecord)
     console.log('Geparster Zeitstempel:', parsedTimestamp)
     console.log('DOY:', dayOfYear)
+    console.log('Sun position:', sunPosition)
+    console.log('Tilted irradiance preview:', tiltedIrradiance)
+    console.log('Tilted Monatswerte Vorschau:', latestTiltedMonthlySeries)
     const monthlySeries = aggregateMonthlyIrradiation(parsedRecords)
     updateChartWithMonthlySeries(monthlySeries, stationName)
+    updateYieldEstimation()
   } catch (error) {
     console.error('Fehler beim Laden der DWD-ZIP-Datei:', error)
   }
@@ -637,10 +755,38 @@ backButtonEl.addEventListener('click', () => {
 })
 
 azimuthSliderEl.addEventListener('input', () => {
+  if (latestHourlyRecords.length > 0) {
+    const selectedComparisonYear = latestMonthlySeries.length > 0
+      ? Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
+      : new Date().getFullYear()
+
+    latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
+      latestHourlyRecords,
+      selectedComparisonYear,
+      latestSelectedLocation,
+      Number(azimuthSliderEl.value),
+      Number(tiltSliderEl.value)
+    )
+  }
+
   updateYieldEstimation()
 })
 
 tiltSliderEl.addEventListener('input', () => {
+  if (latestHourlyRecords.length > 0) {
+    const selectedComparisonYear = latestMonthlySeries.length > 0
+      ? Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
+      : new Date().getFullYear()
+
+    latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
+      latestHourlyRecords,
+      selectedComparisonYear,
+      latestSelectedLocation,
+      Number(azimuthSliderEl.value),
+      Number(tiltSliderEl.value)
+    )
+  }
+
   updateYieldEstimation()
 })
 
