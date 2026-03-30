@@ -10,6 +10,17 @@ import {
   getSunPosition,
   getTiltedGlobalIrradiance,
 } from './solarMath'
+import {
+  buildDwdSolarZipUrl,
+  parseDwdSolarProduct,
+  normalizeHourlySolarRecord,
+  parseDwdTimestamp,
+  aggregateMonthlyIrradiation,
+} from './dwdUtils'
+
+// -----------------------------------------------------------------------------
+// DWD configuration and shared application state
+// -----------------------------------------------------------------------------
 // DWD source for hourly solar station metadata. The Vite dev proxy maps /dwd to opendata.dwd.de.
 const DWD_STATION_METADATA_URL =
   '/dwd/climate_environment/CDC/observations_germany/climate/hourly/solar/ST_Stundenwerte_Beschreibung_Stationen.txt'
@@ -33,6 +44,10 @@ let latestSelectedLocation = {
   lon: DEFAULT_LOCATION.lon,
   label: DEFAULT_LOCATION.name,
 }
+
+// -----------------------------------------------------------------------------
+// App layout
+// -----------------------------------------------------------------------------
 
 document.querySelector('#app').innerHTML = `
   <div class="app">
@@ -104,11 +119,25 @@ document.querySelector('#app').innerHTML = `
             <input id="azimuth-slider" type="range" min="0" max="360" value="180" step="1" />
             <span id="azimuth-value">180°</span>
           </label>
-
+          
           <label class="slider-control">
             <span>Neigung des Moduls</span>
             <input id="tilt-slider" type="range" min="0" max="90" value="35" step="1" />
             <span id="tilt-value">35°</span>
+          </label>
+        </div>
+        <div class="yield-controls">
+          <label class="slider-control">
+            <span>Max Power pro Modul (W)</span>
+            <input id="module-power-input" type="number" min="1" step="1" value="450" />
+          </label>
+          <label class="slider-control">
+            <span>Modulfläche pro Modul (m²)</span>
+            <input id="module-area-input" type="number" min="0.1" step="0.01" value="2.0" />
+          </label>
+          <label class="slider-control">
+            <span>Anzahl Module</span>
+            <input id="module-count-input" type="number" min="1" step="1" value="20" />
           </label>
         </div>
 
@@ -118,8 +147,16 @@ document.querySelector('#app').innerHTML = `
             <span id="orientation-factor">-</span>
           </div>
           <div class="kpi-card">
-            <strong>Geschätzter relativer Ertrag</strong>
+            <strong>Geneigte Jahresstrahlung</strong>
             <span id="estimated-yield">-</span>
+          </div>
+          <div class="kpi-card">
+            <strong>STC-Wirkungsgrad</strong>
+            <span id="module-efficiency">-</span>
+          </div>
+          <div class="kpi-card">
+            <strong>Geschätzter Jahresertrag</strong>
+            <span id="annual-energy-yield">-</span>
           </div>
         </div>
 
@@ -128,6 +165,10 @@ document.querySelector('#app').innerHTML = `
     </div>
   </div>
 `
+
+// -----------------------------------------------------------------------------
+// Map setup and DOM references
+// -----------------------------------------------------------------------------
 
 const map = L.map('map').setView([51.1657, 10.4515], 6)
 setTimeout(() => {
@@ -151,11 +192,20 @@ const azimuthValueEl = document.querySelector('#azimuth-value')
 const tiltValueEl = document.querySelector('#tilt-value')
 const orientationFactorEl = document.querySelector('#orientation-factor')
 const estimatedYieldEl = document.querySelector('#estimated-yield')
+const modulePowerInputEl = document.querySelector('#module-power-input')
+const moduleAreaInputEl = document.querySelector('#module-area-input')
+const moduleCountInputEl = document.querySelector('#module-count-input')
+const moduleEfficiencyEl = document.querySelector('#module-efficiency')
+const annualEnergyYieldEl = document.querySelector('#annual-energy-yield')
 
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors',
   maxZoom: 19,
 }).addTo(map)
+
+// -----------------------------------------------------------------------------
+// UI helpers
+// -----------------------------------------------------------------------------
 
 function showMainView() {
   mainViewEl.classList.remove('hidden-view')
@@ -184,24 +234,60 @@ function calculateOrientationFactor(azimuth, tilt) {
 function updateYieldEstimation() {
   const azimuth = Number(azimuthSliderEl.value)
   const tilt = Number(tiltSliderEl.value)
+  const modulePower = Number(modulePowerInputEl.value)
+  const moduleArea = Number(moduleAreaInputEl.value)
+  const moduleCount = Number(moduleCountInputEl.value)
 
   azimuthValueEl.textContent = `${azimuth}°`
   tiltValueEl.textContent = `${tilt}°`
 
   const orientationFactor = calculateOrientationFactor(azimuth, tilt)
-  const estimatedYieldPercent = orientationFactor * 100
-
   orientationFactorEl.textContent = orientationFactor.toFixed(2)
 
+  let annualTiltedIrradiation = null
+
   if (latestTiltedMonthlySeries.length > 0) {
-    const annualTiltedYield = latestTiltedMonthlySeries.reduce(
+    annualTiltedIrradiation = latestTiltedMonthlySeries.reduce(
       (sum, entry) => sum + entry.irradiationKwhPerM2,
       0
     )
-    estimatedYieldEl.textContent = `${annualTiltedYield.toFixed(1)} kWh/m²`
+    estimatedYieldEl.textContent = `${annualTiltedIrradiation.toFixed(1)} kWh/m²`
   } else {
-    estimatedYieldEl.textContent = `${estimatedYieldPercent.toFixed(1)} %`
-  }}
+    estimatedYieldEl.textContent = '-'
+  }
+
+  const hasValidModuleInputs =
+    Number.isFinite(modulePower) &&
+    Number.isFinite(moduleArea) &&
+    Number.isFinite(moduleCount) &&
+    modulePower > 0 &&
+    moduleArea > 0 &&
+    moduleCount > 0
+
+  if (!hasValidModuleInputs) {
+    moduleEfficiencyEl.textContent = '-'
+    annualEnergyYieldEl.textContent = '-'
+    return
+  }
+
+  // STC assumes 1000 W/m² irradiation, so efficiency can be estimated from
+  // module peak power divided by irradiated module area.
+  const moduleEfficiency = modulePower / (1000 * moduleArea)
+  const totalArea = moduleArea * moduleCount
+
+  moduleEfficiencyEl.textContent = `${(moduleEfficiency * 100).toFixed(1)} %`
+
+  if (annualTiltedIrradiation !== null) {
+    const annualEnergyYield = annualTiltedIrradiation * totalArea * moduleEfficiency
+    annualEnergyYieldEl.textContent = `${annualEnergyYield.toFixed(1)} kWh/Jahr`
+  } else {
+    annualEnergyYieldEl.textContent = '-'
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Station lookup and DWD data loading helpers
+// -----------------------------------------------------------------------------
 
 // Calculate the great-circle distance between two coordinates in kilometers.
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
@@ -243,19 +329,14 @@ function findNearestStation(lat, lon, stations) {
   return nearestStation
 }
 
-// Build the DWD ZIP URL for the selected solar station.
-function buildDwdSolarZipUrl(stationId) {
-  const paddedStationId = stationId.toString().padStart(5, '0')
-
-  return `/dwd/climate_environment/CDC/observations_germany/climate/hourly/solar/stundenwerte_ST_${paddedStationId}_row.zip`
-}
-
 // Update the selected location, nearest station label, marker, and chart.
 async function updateLocationAndChart(lat, lng, locationLabel = null) {
   // Use parsed DWD stations when available, otherwise fall back to the local starter list.
   const stationSource = dwdStations.length > 0 ? dwdStations : stations
   const nearestStation = findNearestStation(lat, lng, stationSource)
   const zipUrl = buildDwdSolarZipUrl(nearestStation.stationId)
+  // Persist the exact user-selected location so the tilted calculation uses the
+  // same coordinates as the current map selection.
   latestSelectedLocation = {
     lat,
     lon: lng,
@@ -290,50 +371,10 @@ async function updateLocationAndChart(lat, lng, locationLabel = null) {
   console.log('Gewählter Punkt:', { lat, lng })
 }
 
-// Parse the semicolon-separated DWD product file into record objects.
-function parseDwdSolarProduct(productText) {
-  const lines = productText
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+// -----------------------------------------------------------------------------
+// Data parsing and aggregation helpers
+// -----------------------------------------------------------------------------
 
-  const header = lines[0].split(';').map((value) => value.trim())
-  const dataLines = lines.slice(1)
-
-  const records = dataLines.map((line) => {
-    const parts = line.split(';').map((value) => value.trim())
-
-    const row = {}
-    header.forEach((columnName, index) => {
-      row[columnName] = parts[index]
-    })
-
-    return row
-  })
-
-  return records
-}
-
-function normalizeHourlySolarRecord(record) {
-  const globalHorizontal = Number(record.FG_LBERG)
-  const diffuseHorizontal = Number(record.FD_LBERG)
-  const timestamp = record.MESS_DATUM_WOZ || record.MESS_DATUM
-
-  return {
-    timestamp,
-    globalHorizontal: globalHorizontal === -999 ? null : globalHorizontal,
-    diffuseHorizontal: diffuseHorizontal === -999 ? null : diffuseHorizontal,
-  }
-}
-
-function parseDwdTimestamp(timestamp) {
-  const year = Number(timestamp.slice(0, 4))
-  const month = Number(timestamp.slice(4, 6))
-  const day = Number(timestamp.slice(6, 8))
-  const hour = Number(timestamp.slice(8, 10))
-
-  return { year, month, day, hour }
-}
 
 
 
@@ -354,7 +395,16 @@ function getFirstUsableHourlyRecord(records) {
   return null
 }
 
+function getSelectedComparisonYear() {
+  if (latestMonthlySeries.length > 0) {
+    return Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
+  }
+
+  return new Date().getFullYear()
+}
+
 function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, surfaceTilt) {
+  // Sum the hourly irradiation transformed onto the tilted module plane.
   const monthlySums = new Map()
   const numberOfDaysInYear = getNumberOfDaysInYear(year)
 
@@ -381,6 +431,7 @@ function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, 
       parsedTimestamp.day
     )
 
+    // Derive the solar position for the current hour at the selected location.
     const sunPosition = getSunPosition({
       longitude: location.lon,
       latitude: location.lat,
@@ -394,6 +445,7 @@ function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, 
       continue
     }
 
+    // Transform horizontal irradiation into irradiation on the tilted module plane.
     const tiltedIrradiance = getTiltedGlobalIrradiance({
       globalHorizontal: record.globalHorizontal,
       diffuseHorizontal: record.diffuseHorizontal,
@@ -424,55 +476,27 @@ function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, 
   )
 }
 
-// Aggregate hourly global irradiation values into monthly sums.
-function aggregateMonthlyIrradiation(records) {
-  const monthlyMap = new Map()
-
-  for (const record of records) {
-    const rawDate = record.MESS_DATUM
-    const rawValue = Number(record.FG_LBERG)
-
-    if (!rawDate || Number.isNaN(rawValue) || rawValue === -999) {
-      continue
-    }
-
-    // Convert each hourly record to a YYYYMM key and keep only data from 1990 until today.
-    const yearMonth = rawDate.slice(0, 6)
-    const currentYearMonth = new Date().toISOString().slice(0, 7).replace('-', '')
-    
-    if (yearMonth < '199001' || yearMonth > currentYearMonth) {
-      continue
-    }
-
-    // Create a monthly accumulator when the month appears for the first time.
-    if (!monthlyMap.has(yearMonth)) {
-      monthlyMap.set(yearMonth, {
-        sum: 0,
-        count: 0,
-      })
-    }
-
-    // Add the hourly value to the monthly sum.
-    const monthEntry = monthlyMap.get(yearMonth)
-    monthEntry.sum += rawValue
-    monthEntry.count += 1
+function recalculateTiltedSeries() {
+  if (latestHourlyRecords.length === 0) {
+    latestTiltedMonthlySeries = []
+    return
   }
 
-  // Convert the monthly map into a sorted array and derive display-friendly fields.
-  const monthlySeries = Array.from(monthlyMap.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([yearMonth, values]) => ({
-      yearMonth,
-      year: yearMonth.slice(0, 4),
-      month: yearMonth.slice(4, 6),
-      label: `${yearMonth.slice(0, 4)}-${yearMonth.slice(4, 6)}`,
-      irradiationJPerCm2: values.sum,
-      irradiationKwhPerM2: values.sum / 360,
-      valueCount: values.count,
-    }))
-
-  return monthlySeries
+  latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
+    latestHourlyRecords,
+    getSelectedComparisonYear(),
+    latestSelectedLocation,
+    Number(azimuthSliderEl.value),
+    Number(tiltSliderEl.value)
+  )
 }
+
+// -----------------------------------------------------------------------------
+// Chart helpers
+// -----------------------------------------------------------------------------
+
+// Aggregate hourly global irradiation values into monthly sums.
+
 
 // Extract the available years from the aggregated monthly time series.
 function getAvailableYears(monthlySeries) {
@@ -596,6 +620,10 @@ function updateChartWithMonthlySeries(monthlySeries, stationName) {
   )
 }
 
+// -----------------------------------------------------------------------------
+// DWD fetch pipeline
+// -----------------------------------------------------------------------------
+
 // Load a station ZIP file, parse the product file, and update the chart.
 async function testDwdZipFetch(zipUrl, stationName) {
   try {
@@ -623,54 +651,10 @@ async function testDwdZipFetch(zipUrl, stationName) {
 
     const parsedRecords = parseDwdSolarProduct(productText)
 
-    // Keep the hourly records in memory for later tilted-plane calculations.
+    // Keep the full hourly time series in memory so the yield view can recompute
+    // tilted irradiation without reloading the DWD ZIP file.
     latestHourlyRecords = parsedRecords
-    console.log('Hourly records gespeichert:', latestHourlyRecords.length)
-    const firstUsableRecord = getFirstUsableHourlyRecord(latestHourlyRecords)
-    const parsedTimestamp = firstUsableRecord
-      ? parseDwdTimestamp(firstUsableRecord.timestamp)
-      : null
-    const dayOfYear = parsedTimestamp
-      ? getDayOfYear(parsedTimestamp.year, parsedTimestamp.month, parsedTimestamp.day)
-      : null
-    const sunPosition = parsedTimestamp
-      ? getSunPosition({
-          longitude: latestSelectedLocation.lon,
-          latitude: latestSelectedLocation.lat,
-          dayOfYear,
-          timeZone: 1,
-          localTime: parsedTimestamp.hour,
-        })
-      : null
-    const tiltedIrradiance = firstUsableRecord && sunPosition
-      ? getTiltedGlobalIrradiance({
-          globalHorizontal: firstUsableRecord.globalHorizontal,
-          diffuseHorizontal: firstUsableRecord.diffuseHorizontal,
-          surfaceAzimuth: Number(azimuthSliderEl.value),
-          surfaceTilt: Number(tiltSliderEl.value),
-          sunAzimuth: sunPosition.sunAzimuth,
-          sunElevation: sunPosition.sunElevation,
-          albedo: 0.2,
-        })
-      : null
-    const selectedComparisonYear = latestMonthlySeries.length > 0
-      ? Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
-      : new Date().getFullYear()
-
-    latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
-      parsedRecords,
-      selectedComparisonYear,
-      latestSelectedLocation,
-      Number(azimuthSliderEl.value),
-      Number(tiltSliderEl.value)
-    )
-    console.log('Aktueller Berechnungsstandort:', latestSelectedLocation)
-    console.log('Erster brauchbarer stündlicher Datensatz:', firstUsableRecord)
-    console.log('Geparster Zeitstempel:', parsedTimestamp)
-    console.log('DOY:', dayOfYear)
-    console.log('Sun position:', sunPosition)
-    console.log('Tilted irradiance preview:', tiltedIrradiance)
-    console.log('Tilted Monatswerte Vorschau:', latestTiltedMonthlySeries)
+    recalculateTiltedSeries()
     const monthlySeries = aggregateMonthlyIrradiation(parsedRecords)
     updateChartWithMonthlySeries(monthlySeries, stationName)
     updateYieldEstimation()
@@ -678,6 +662,10 @@ async function testDwdZipFetch(zipUrl, stationName) {
     console.error('Fehler beim Laden der DWD-ZIP-Datei:', error)
   }
 }
+
+// -----------------------------------------------------------------------------
+// App bootstrap and event listeners
+// -----------------------------------------------------------------------------
 
 // Load and parse the DWD solar station metadata file.
 async function testDwdStationMetadataFetch() {
@@ -697,6 +685,7 @@ async function testDwdStationMetadataFetch() {
 
     const dataLines = lines.slice(2)
 
+    // Parse the fixed-width-like station description file into station objects.
     const parsedStations = dataLines.map((line) => {
       const parts = line.split(/\s+/)
 
@@ -732,11 +721,14 @@ map.on('click', async (event) => {
   await updateLocationAndChart(lat, lng)
 })
 
-// Redraw the chart when the selected end year changes.
+// Redraw the chart and recalculate tilted series when the selected end year changes.
 yearSelectEl.addEventListener('change', () => {
   if (latestMonthlySeries.length > 0) {
     updateChartWithMonthlySeries(latestMonthlySeries, latestStationName)
   }
+
+  recalculateTiltedSeries()
+  updateYieldEstimation()
 })
 
 // Redraw the chart when the year range changes.
@@ -754,39 +746,25 @@ backButtonEl.addEventListener('click', () => {
   showMainView()
 })
 
+modulePowerInputEl.addEventListener('input', () => {
+  updateYieldEstimation()
+})
+
+moduleAreaInputEl.addEventListener('input', () => {
+  updateYieldEstimation()
+})
+
+moduleCountInputEl.addEventListener('input', () => {
+  updateYieldEstimation()
+})
+
 azimuthSliderEl.addEventListener('input', () => {
-  if (latestHourlyRecords.length > 0) {
-    const selectedComparisonYear = latestMonthlySeries.length > 0
-      ? Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
-      : new Date().getFullYear()
-
-    latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
-      latestHourlyRecords,
-      selectedComparisonYear,
-      latestSelectedLocation,
-      Number(azimuthSliderEl.value),
-      Number(tiltSliderEl.value)
-    )
-  }
-
+  recalculateTiltedSeries()
   updateYieldEstimation()
 })
 
 tiltSliderEl.addEventListener('input', () => {
-  if (latestHourlyRecords.length > 0) {
-    const selectedComparisonYear = latestMonthlySeries.length > 0
-      ? Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
-      : new Date().getFullYear()
-
-    latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
-      latestHourlyRecords,
-      selectedComparisonYear,
-      latestSelectedLocation,
-      Number(azimuthSliderEl.value),
-      Number(tiltSliderEl.value)
-    )
-  }
-
+  recalculateTiltedSeries()
   updateYieldEstimation()
 })
 
