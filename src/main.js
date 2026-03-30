@@ -375,26 +375,6 @@ async function updateLocationAndChart(lat, lng, locationLabel = null) {
 // Data parsing and aggregation helpers
 // -----------------------------------------------------------------------------
 
-
-
-
-function getFirstUsableHourlyRecord(records) {
-  for (const record of records) {
-    const normalized = normalizeHourlySolarRecord(record)
-
-    if (
-      normalized.timestamp &&
-      normalized.globalHorizontal !== null &&
-      normalized.diffuseHorizontal !== null &&
-      normalized.globalHorizontal > 0
-    ) {
-      return normalized
-    }
-  }
-
-  return null
-}
-
 function getSelectedComparisonYear() {
   if (latestMonthlySeries.length > 0) {
     return Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
@@ -494,9 +474,6 @@ function recalculateTiltedSeries() {
 // -----------------------------------------------------------------------------
 // Chart helpers
 // -----------------------------------------------------------------------------
-
-// Aggregate hourly global irradiation values into monthly sums.
-
 
 // Extract the available years from the aggregated monthly time series.
 function getAvailableYears(monthlySeries) {
