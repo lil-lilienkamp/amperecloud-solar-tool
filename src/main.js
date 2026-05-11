@@ -16,417 +16,318 @@ import {
   normalizeHourlySolarRecord,
   parseDwdTimestamp,
   aggregateMonthlyIrradiation,
+  J_PER_CM2_TO_KWH_PER_M2,
 } from './dwdUtils'
 
-// -----------------------------------------------------------------------------
-// DWD configuration and shared application state
-// -----------------------------------------------------------------------------
-// DWD source for hourly solar station metadata. The Vite dev proxy maps /dwd to opendata.dwd.de.
+// The Vite dev proxy maps /dwd to opendata.dwd.de.
 const DWD_STATION_METADATA_URL =
   '/dwd/climate_environment/CDC/observations_germany/climate/hourly/solar/ST_Stundenwerte_Beschreibung_Stationen.txt'
 
-// Initial map location shown when the app loads.
-const DEFAULT_LOCATION = {
-  name: 'Amperecloud Berlin',
-  lat: 52.527,
-  lon: 13.4178,
-}
+const DEFAULT_LOCATION = { name: 'Amperecloud Berlin', lat: 52.527, lon: 13.4178 }
 
-// Shared application state.
-let dwdStations = []
-let marker = null
-let latestMonthlySeries = []
-let latestTiltedMonthlySeries = []
-let latestHourlyRecords = []
-let latestStationName = ''
-let latestSelectedLocation = {
-  lat: DEFAULT_LOCATION.lat,
-  lon: DEFAULT_LOCATION.lon,
-  label: DEFAULT_LOCATION.name,
-}
+const MONTH_LABELS = ['Jan', 'Feb', 'Mrz', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez']
+const MONTH_KEYS   = ['01',  '02',  '03',  '04',  '05',  '06',  '07',  '08',  '09',  '10',  '11',  '12']
 
-// -----------------------------------------------------------------------------
-// App layout
-// -----------------------------------------------------------------------------
+// Shared mutable state
+let dwdStations            = []
+let marker                 = null
+let latestMonthlySeries    = []
+let latestTiltedSeries     = []
+let latestHourlyRecords    = []
+let latestStationName      = ''
+let latestSelectedLocation = { lat: DEFAULT_LOCATION.lat, lon: DEFAULT_LOCATION.lon }
+
+// ── Layout ────────────────────────────────────────────────────────────────────
 
 document.querySelector('#app').innerHTML = `
   <div class="app">
-    <div id="main-view">
+    <header class="app-header">
       <h1>Amperecloud Solar Irradiation Explorer</h1>
-      <p class="subtitle">
-        MVP – Standortwahl per Karte und interaktive Visualisierung von Solarstrahlung
-      </p>
+      <p class="subtitle">Standortwahl per Karte · Historische Solarstrahlung · PV-Ertragsschätzung</p>
+    </header>
 
-      <!-- Main layout: map on the left, chart and controls on the right -->
-      <div class="top-grid">
-        <div class="card">
-          <h2>Karte</h2>
-          <!-- Selected location and nearest DWD station -->
-          <div class="info-box">
-            <strong>Gewählter Standort:</strong>
-            <span id="selected-location">Noch kein Punkt gewählt</span>
-            <br />
-            <strong>Nächste Station:</strong>
-            <span id="nearest-station">Noch keine Station gewählt</span>
+    <div class="top-grid">
+      <div class="card">
+        <h2>Standort</h2>
+        <div class="info-box">
+          <div class="info-row">
+            <span class="info-label">Gewählter Standort</span>
+            <span id="selected-location" class="info-value">Auf Karte klicken…</span>
           </div>
-          <div id="map"></div>
+          <div class="info-row">
+            <span class="info-label">Nächste DWD-Station</span>
+            <span id="nearest-station" class="info-value">–</span>
+          </div>
         </div>
+        <div id="map"></div>
+      </div>
 
-        <div class="card">
-          <h2>Visualisierung</h2>
-          <!-- Controls for choosing the comparison years shown in the chart -->
-          <div class="chart-controls">
-            <label class="chart-control">
-              <span>Jahr</span>
-              <select id="year-select"></select>
-            </label>
-            <label class="chart-control">
-              <span>Anzahl Jahre</span>
-              <select id="year-range-select">
-                <option value="1">1 Jahr</option>
-                <option value="2">2 Jahre</option>
-                <option value="5">5 Jahre</option>
-                <option value="10">10 Jahre</option>
-              </select>
-            </label>
+      <div class="card">
+        <h2>Monatliche Globalstrahlung</h2>
+        <div class="chart-controls">
+          <label class="chart-control">
+            <span>Jahr</span>
+            <select id="year-select"></select>
+          </label>
+          <label class="chart-control">
+            <span>Vergleich</span>
+            <select id="year-range-select">
+              <option value="1">1 Jahr</option>
+              <option value="2">2 Jahre</option>
+              <option value="5">5 Jahre</option>
+              <option value="10">10 Jahre</option>
+            </select>
+          </label>
+        </div>
+        <div id="chart-loading" class="chart-loading">
+          <div class="spinner"></div>
+          <span>DWD-Daten werden geladen…</span>
+        </div>
+        <div id="chart-error" class="chart-error hidden"></div>
+        <div id="irradiance-chart" style="display:none"></div>
+        <div id="annual-kpis" class="annual-kpis hidden">
+          <div class="kpi-chip">
+            <span class="chip-label">Ausgewähltes Jahr</span>
+            <span id="annual-selected" class="chip-value">–</span>
           </div>
-
-          <!-- Plotly chart container -->
-          <div id="chart"></div>
-          <button id="yield-button" class="primary-button">Ertrag berechnen</button>
+          <div class="kpi-chip">
+            <span class="chip-label">Ø Alle Jahre</span>
+            <span id="annual-avg" class="chip-value">–</span>
+          </div>
+          <div class="kpi-chip">
+            <span class="chip-label">Bestes Jahr</span>
+            <span id="annual-best" class="chip-value">–</span>
+          </div>
         </div>
       </div>
     </div>
 
-    <div id="yield-view" class="hidden-view">
-      <h1>PV-Ertragsrechner</h1>
-      <p class="subtitle">
-        Konfiguration von Modulausrichtung und Neigung zur Ertragsabschätzung
-      </p>
+    <div class="card yield-card">
+      <h2>PV-Ertragsrechner</h2>
+      <div class="yield-grid">
+        <div class="yield-controls-col">
+          <div class="controls-group">
+            <h3>Ausrichtung</h3>
+            <label class="slider-control">
+              <div class="slider-header">
+                <span>Azimut</span>
+                <span id="azimuth-value" class="slider-badge">180°</span>
+              </div>
+              <input id="azimuth-slider" type="range" min="0" max="360" value="180" step="1" />
+            </label>
+            <label class="slider-control">
+              <div class="slider-header">
+                <span>Neigung</span>
+                <span id="tilt-value" class="slider-badge">35°</span>
+              </div>
+              <input id="tilt-slider" type="range" min="0" max="90" value="35" step="1" />
+            </label>
+          </div>
 
-      <div class="card">
-        <div class="info-box">
-          <strong>Standort:</strong>
-          <span id="yield-location">Noch kein Standort gewählt</span>
-          <br />
-          <strong>DWD-Station:</strong>
-          <span id="yield-station">Noch keine Station gewählt</span>
+          <div class="controls-group">
+            <h3>Module</h3>
+            <div class="module-inputs">
+              <label class="input-control">
+                <span>Leistung (W/Modul)</span>
+                <input id="module-power-input" type="number" min="1" step="1" value="450" />
+              </label>
+              <label class="input-control">
+                <span>Fläche (m²/Modul)</span>
+                <input id="module-area-input" type="number" min="0.1" step="0.01" value="2.0" />
+              </label>
+              <label class="input-control">
+                <span>Anzahl Module</span>
+                <input id="module-count-input" type="number" min="1" step="1" value="20" />
+              </label>
+              <label class="input-control">
+                <span>Strompreis (€/kWh)</span>
+                <input id="electricity-price-input" type="number" min="0" step="0.001" value="0.10" />
+              </label>
+            </div>
+          </div>
+
+          <div class="yield-kpis">
+            <div class="kpi-card">
+              <span class="kpi-label">Geneigte Jahresstrahlung</span>
+              <span id="estimated-yield" class="kpi-value">–</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">STC-Wirkungsgrad</span>
+              <span id="module-efficiency" class="kpi-value">–</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">Jahresertrag</span>
+              <span id="annual-energy-yield" class="kpi-value">–</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-label">Jahresumsatz</span>
+              <span id="annual-revenue" class="kpi-value">–</span>
+            </div>
+          </div>
         </div>
 
-        <div class="yield-controls">
-          <label class="slider-control">
-            <span>Azimut des Moduls</span>
-            <input id="azimuth-slider" type="range" min="0" max="360" value="180" step="1" />
-            <span id="azimuth-value">180°</span>
-          </label>
-          
-          <label class="slider-control">
-            <span>Neigung des Moduls</span>
-            <input id="tilt-slider" type="range" min="0" max="90" value="35" step="1" />
-            <span id="tilt-value">35°</span>
-          </label>
-        </div>
-        <div class="yield-controls">
-          <label class="slider-control">
-            <span>Max Power pro Modul (W)</span>
-            <input id="module-power-input" type="number" min="1" step="1" value="450" />
-          </label>
-          <label class="slider-control">
-            <span>Modulfläche pro Modul (m²)</span>
-            <input id="module-area-input" type="number" min="0.1" step="0.01" value="2.0" />
-          </label>
-          <label class="slider-control">
-            <span>Anzahl Module</span>
-            <input id="module-count-input" type="number" min="1" step="1" value="20" />
-          </label>
-        </div>
-
-        <div class="yield-kpis">
-          <div class="kpi-card">
-            <strong>Orientierungsfaktor</strong>
-            <span id="orientation-factor">-</span>
-          </div>
-          <div class="kpi-card">
-            <strong>Geneigte Jahresstrahlung</strong>
-            <span id="estimated-yield">-</span>
-          </div>
-          <div class="kpi-card">
-            <strong>STC-Wirkungsgrad</strong>
-            <span id="module-efficiency">-</span>
-          </div>
-          <div class="kpi-card">
-            <strong>Geschätzter Jahresertrag</strong>
-            <span id="annual-energy-yield">-</span>
+        <div class="yield-chart-col">
+          <div id="yield-chart" class="yield-chart-empty">
+            <span>Wähle einen Standort um den Monatsertrag zu sehen</span>
           </div>
         </div>
-
-        <button id="back-button" class="primary-button">Zurück zur Karte</button>
       </div>
     </div>
   </div>
 `
 
-// -----------------------------------------------------------------------------
-// Map setup and DOM references
-// -----------------------------------------------------------------------------
+// ── Map ───────────────────────────────────────────────────────────────────────
 
 const map = L.map('map').setView([51.1657, 10.4515], 6)
-setTimeout(() => {
-  map.invalidateSize()
-}, 100)
-
-// Cache references to the DOM elements that are updated during interaction.
-const selectedLocationEl = document.querySelector('#selected-location')
-const nearestStationEl = document.querySelector('#nearest-station')
-const yearSelectEl = document.querySelector('#year-select')
-const yearRangeSelectEl = document.querySelector('#year-range-select')
-const mainViewEl = document.querySelector('#main-view')
-const yieldViewEl = document.querySelector('#yield-view')
-const yieldButtonEl = document.querySelector('#yield-button')
-const backButtonEl = document.querySelector('#back-button')
-const yieldLocationEl = document.querySelector('#yield-location')
-const yieldStationEl = document.querySelector('#yield-station')
-const azimuthSliderEl = document.querySelector('#azimuth-slider')
-const tiltSliderEl = document.querySelector('#tilt-slider')
-const azimuthValueEl = document.querySelector('#azimuth-value')
-const tiltValueEl = document.querySelector('#tilt-value')
-const orientationFactorEl = document.querySelector('#orientation-factor')
-const estimatedYieldEl = document.querySelector('#estimated-yield')
-const modulePowerInputEl = document.querySelector('#module-power-input')
-const moduleAreaInputEl = document.querySelector('#module-area-input')
-const moduleCountInputEl = document.querySelector('#module-count-input')
-const moduleEfficiencyEl = document.querySelector('#module-efficiency')
-const annualEnergyYieldEl = document.querySelector('#annual-energy-yield')
+setTimeout(() => map.invalidateSize(), 100)
 
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors',
   maxZoom: 19,
 }).addTo(map)
 
-// -----------------------------------------------------------------------------
-// UI helpers
-// -----------------------------------------------------------------------------
+// ── DOM refs ──────────────────────────────────────────────────────────────────
 
-function showMainView() {
-  mainViewEl.classList.remove('hidden-view')
-  yieldViewEl.classList.add('hidden-view')
-}
+const selectedLocationEl    = document.querySelector('#selected-location')
+const nearestStationEl      = document.querySelector('#nearest-station')
+const yearSelectEl          = document.querySelector('#year-select')
+const yearRangeSelectEl     = document.querySelector('#year-range-select')
+const azimuthSliderEl       = document.querySelector('#azimuth-slider')
+const tiltSliderEl          = document.querySelector('#tilt-slider')
+const azimuthValueEl        = document.querySelector('#azimuth-value')
+const tiltValueEl           = document.querySelector('#tilt-value')
+const estimatedYieldEl      = document.querySelector('#estimated-yield')
+const modulePowerInputEl    = document.querySelector('#module-power-input')
+const moduleAreaInputEl     = document.querySelector('#module-area-input')
+const moduleCountInputEl    = document.querySelector('#module-count-input')
+const moduleEfficiencyEl    = document.querySelector('#module-efficiency')
+const annualEnergyYieldEl   = document.querySelector('#annual-energy-yield')
+const electricityPriceInputEl = document.querySelector('#electricity-price-input')
+const annualRevenueEl       = document.querySelector('#annual-revenue')
+const chartLoadingEl        = document.querySelector('#chart-loading')
+const chartErrorEl          = document.querySelector('#chart-error')
+const irradianceChartEl     = document.querySelector('#irradiance-chart')
+const annualKpisEl          = document.querySelector('#annual-kpis')
+const annualSelectedEl      = document.querySelector('#annual-selected')
+const annualAvgEl           = document.querySelector('#annual-avg')
+const annualBestEl          = document.querySelector('#annual-best')
+const yieldChartEl          = document.querySelector('#yield-chart')
 
-function showYieldView() {
-  mainViewEl.classList.add('hidden-view')
-  yieldViewEl.classList.remove('hidden-view')
-}
+// ── General helpers ───────────────────────────────────────────────────────────
 
-function calculateOrientationFactor(azimuth, tilt) {
-  const azimuthDeviation = Math.abs(azimuth - 180)
-  const normalizedAzimuthLoss = Math.min(azimuthDeviation / 180, 1)
-
-  const optimalTilt = 35
-  const tiltDeviation = Math.abs(tilt - optimalTilt)
-  const normalizedTiltLoss = Math.min(tiltDeviation / 55, 1)
-
-  const azimuthFactor = 1 - 0.22 * normalizedAzimuthLoss
-  const tiltFactor = 1 - 0.12 * normalizedTiltLoss
-
-  return Math.max(0.6, azimuthFactor * tiltFactor)
-}
-
-function updateYieldEstimation() {
-  const azimuth = Number(azimuthSliderEl.value)
-  const tilt = Number(tiltSliderEl.value)
-  const modulePower = Number(modulePowerInputEl.value)
-  const moduleArea = Number(moduleAreaInputEl.value)
-  const moduleCount = Number(moduleCountInputEl.value)
-
-  azimuthValueEl.textContent = `${azimuth}°`
-  tiltValueEl.textContent = `${tilt}°`
-
-  const orientationFactor = calculateOrientationFactor(azimuth, tilt)
-  orientationFactorEl.textContent = orientationFactor.toFixed(2)
-
-  let annualTiltedIrradiation = null
-
-  if (latestTiltedMonthlySeries.length > 0) {
-    annualTiltedIrradiation = latestTiltedMonthlySeries.reduce(
-      (sum, entry) => sum + entry.irradiationKwhPerM2,
-      0
-    )
-    estimatedYieldEl.textContent = `${annualTiltedIrradiation.toFixed(1)} kWh/m²`
-  } else {
-    estimatedYieldEl.textContent = '-'
+function debounce(fn, delay) {
+  let timer
+  return (...args) => {
+    clearTimeout(timer)
+    timer = setTimeout(() => fn(...args), delay)
   }
+}
 
-  const hasValidModuleInputs =
-    Number.isFinite(modulePower) &&
-    Number.isFinite(moduleArea) &&
-    Number.isFinite(moduleCount) &&
-    modulePower > 0 &&
-    moduleArea > 0 &&
-    moduleCount > 0
+function setIrradianceChartState(state, message = '') {
+  irradianceChartEl.style.display = state === 'ready' ? '' : 'none'
+  chartLoadingEl.classList.toggle('hidden', state !== 'loading')
+  chartErrorEl.classList.toggle('hidden', state !== 'error')
+  annualKpisEl.classList.toggle('hidden', state !== 'ready')
+  if (state === 'error') chartErrorEl.textContent = message
+}
 
-  if (!hasValidModuleInputs) {
-    moduleEfficiencyEl.textContent = '-'
-    annualEnergyYieldEl.textContent = '-'
+// ── Timezone helpers (CET / CEST) ─────────────────────────────────────────────
+
+function getLastSundayOfMonth(year, month) {
+  const lastDay = new Date(year, month, 0).getDate()
+  return lastDay - new Date(year, month - 1, lastDay).getDay()
+}
+
+// Germany uses CET (UTC+1) in winter and CEST (UTC+2) from the last Sunday of
+// March to the last Sunday of October. Using UTC+1 year-round skews summer sun
+// positions by a full hour — enough to meaningfully affect tilted yield totals.
+function getCentralEuropeanOffset(year, month, day) {
+  if (month > 3 && month < 10) return 2
+  if (month < 3 || month > 10) return 1
+  const lastSunday = getLastSundayOfMonth(year, month)
+  if (month === 3) return day >= lastSunday ? 2 : 1
+  return day < lastSunday ? 2 : 1
+}
+
+// ── Station lookup ────────────────────────────────────────────────────────────
+
+function getDistanceInKm(lat1, lon1, lat2, lon2) {
+  const toRad = (v) => (v * Math.PI) / 180
+  const dLat = toRad(lat2 - lat1)
+  const dLon = toRad(lon2 - lon1)
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+function findNearestStation(lat, lon, stationList) {
+  let nearest = null
+  let minDist = Infinity
+  for (const s of stationList) {
+    const d = getDistanceInKm(lat, lon, s.lat, s.lon)
+    if (d < minDist) { minDist = d; nearest = { ...s, distanceKm: d } }
+  }
+  return nearest
+}
+
+async function updateLocationAndChart(lat, lng, locationLabel = null) {
+  const stationSource = dwdStations.length > 0 ? dwdStations : stations
+  const nearestStation = findNearestStation(lat, lng, stationSource)
+
+  if (!nearestStation?.stationId) {
+    setIrradianceChartState('error', 'DWD-Stationsdaten nicht verfügbar – bitte Seite neu laden.')
     return
   }
 
-  // STC assumes 1000 W/m² irradiation, so efficiency can be estimated from
-  // module peak power divided by irradiated module area.
-  const moduleEfficiency = modulePower / (1000 * moduleArea)
-  const totalArea = moduleArea * moduleCount
+  latestSelectedLocation = { lat, lon: lng }
 
-  moduleEfficiencyEl.textContent = `${(moduleEfficiency * 100).toFixed(1)} %`
-
-  if (annualTiltedIrradiation !== null) {
-    const annualEnergyYield = annualTiltedIrradiation * totalArea * moduleEfficiency
-    annualEnergyYieldEl.textContent = `${annualEnergyYield.toFixed(1)} kWh/Jahr`
-  } else {
-    annualEnergyYieldEl.textContent = '-'
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Station lookup and DWD data loading helpers
-// -----------------------------------------------------------------------------
-
-// Calculate the great-circle distance between two coordinates in kilometers.
-function getDistanceInKm(lat1, lon1, lat2, lon2) {
-  const toRad = (value) => (value * Math.PI) / 180
-
-  const earthRadiusKm = 6371
-  const dLat = toRad(lat2 - lat1)
-  const dLon = toRad(lon2 - lon1)
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2)
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-
-  return earthRadiusKm * c
-}
-
-// Find the nearest station from a list of station objects.
-function findNearestStation(lat, lon, stations) {
-  let nearestStation = null
-  let minDistance = Infinity
-
-  for (const station of stations) {
-    const distance = getDistanceInKm(lat, lon, station.lat, station.lon)
-
-    if (distance < minDistance) {
-      minDistance = distance
-      nearestStation = {
-        ...station,
-        distanceKm: distance,
-      }
-    }
-  }
-
-  return nearestStation
-}
-
-// Update the selected location, nearest station label, marker, and chart.
-async function updateLocationAndChart(lat, lng, locationLabel = null) {
-  // Use parsed DWD stations when available, otherwise fall back to the local starter list.
-  const stationSource = dwdStations.length > 0 ? dwdStations : stations
-  const nearestStation = findNearestStation(lat, lng, stationSource)
-  const zipUrl = buildDwdSolarZipUrl(nearestStation.stationId)
-  // Persist the exact user-selected location so the tilted calculation uses the
-  // same coordinates as the current map selection.
-  latestSelectedLocation = {
-    lat,
-    lon: lng,
-    label: locationLabel ?? `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
-  }
-
-  console.log('DWD ZIP URL:', zipUrl)
-  console.log('Nächste Station:', nearestStation)
-
-  // Move the existing marker or create it the first time.
   if (marker) {
     marker.setLatLng([lat, lng])
   } else {
     marker = L.marker([lat, lng]).addTo(map)
   }
 
-  marker
-    .bindPopup(
-      `${locationLabel ?? 'Gewählter Standort'}<br>Lat: ${lat.toFixed(4)}<br>Lon: ${lng.toFixed(4)}`
-    )
-    .openPopup()
+  const label = locationLabel ?? `${lat.toFixed(4)}, ${lng.toFixed(4)}`
+  marker.bindPopup(`${label}<br>${lat.toFixed(4)}, ${lng.toFixed(4)}`).openPopup()
 
-  // Update the UI labels for the clicked location and the nearest station.
-  selectedLocationEl.textContent = locationLabel ?? `${lat.toFixed(4)}, ${lng.toFixed(4)}`
-  nearestStationEl.textContent = `${nearestStation.name} (${nearestStation.distanceKm.toFixed(1)} km entfernt)`
-  yieldLocationEl.textContent = locationLabel ?? `${lat.toFixed(4)}, ${lng.toFixed(4)}`
-  yieldStationEl.textContent = `${nearestStation.name} (${nearestStation.distanceKm.toFixed(1)} km entfernt)`
+  selectedLocationEl.textContent = label
+  nearestStationEl.textContent = `${nearestStation.name} (${nearestStation.distanceKm.toFixed(1)} km)`
 
-  // Load the measurement ZIP for the nearest station and redraw the chart.
-  await testDwdZipFetch(zipUrl, nearestStation.name)
-
-  console.log('Gewählter Punkt:', { lat, lng })
+  await loadStationData(buildDwdSolarZipUrl(nearestStation.stationId), nearestStation.name)
 }
 
-// -----------------------------------------------------------------------------
-// Data parsing and aggregation helpers
-// -----------------------------------------------------------------------------
+// ── Data processing ───────────────────────────────────────────────────────────
 
 function getSelectedComparisonYear() {
-  if (latestMonthlySeries.length > 0) {
-    return Number(yearSelectEl.value || latestMonthlySeries[latestMonthlySeries.length - 1].year)
-  }
-
-  return new Date().getFullYear()
+  return latestMonthlySeries.length > 0
+    ? Number(yearSelectEl.value || latestMonthlySeries.at(-1).year)
+    : new Date().getFullYear()
 }
 
 function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, surfaceTilt) {
-  // Sum the hourly irradiation transformed onto the tilted module plane.
   const monthlySums = new Map()
   const numberOfDaysInYear = getNumberOfDaysInYear(year)
 
   for (const rawRecord of records) {
     const record = normalizeHourlySolarRecord(rawRecord)
+    if (!record.timestamp || record.globalHorizontal === null || record.diffuseHorizontal === null) continue
 
-    if (
-      !record.timestamp ||
-      record.globalHorizontal === null ||
-      record.diffuseHorizontal === null
-    ) {
-      continue
-    }
+    const ts = parseDwdTimestamp(record.timestamp)
+    if (ts.year !== year) continue
 
-    const parsedTimestamp = parseDwdTimestamp(record.timestamp)
-
-    if (parsedTimestamp.year !== year) {
-      continue
-    }
-
-    const dayOfYear = getDayOfYear(
-      parsedTimestamp.year,
-      parsedTimestamp.month,
-      parsedTimestamp.day
-    )
-
-    // Derive the solar position for the current hour at the selected location.
     const sunPosition = getSunPosition({
       longitude: location.lon,
       latitude: location.lat,
-      dayOfYear,
-      timeZone: 1,
-      localTime: parsedTimestamp.hour,
+      dayOfYear: getDayOfYear(ts.year, ts.month, ts.day),
+      timeZone: getCentralEuropeanOffset(ts.year, ts.month, ts.day),
+      localTime: ts.hour,
       numberOfDaysInYear,
     })
 
-    if (!sunPosition || sunPosition.sunElevation <= 0) {
-      continue
-    }
+    if (!sunPosition || sunPosition.sunElevation <= 0) continue
 
-    // Transform horizontal irradiation into irradiation on the tilted module plane.
-    const tiltedIrradiance = getTiltedGlobalIrradiance({
+    const { globalTilted } = getTiltedGlobalIrradiance({
       globalHorizontal: record.globalHorizontal,
       diffuseHorizontal: record.diffuseHorizontal,
       surfaceAzimuth,
@@ -436,115 +337,89 @@ function aggregateTiltedMonthlyForYear(records, year, location, surfaceAzimuth, 
       albedo: 0.2,
     })
 
-    const monthKey = String(parsedTimestamp.month).padStart(2, '0')
-
-    if (!monthlySums.has(monthKey)) {
-      monthlySums.set(monthKey, 0)
-    }
-
-    monthlySums.set(monthKey, monthlySums.get(monthKey) + tiltedIrradiance.globalTilted)
+    const monthKey = String(ts.month).padStart(2, '0')
+    monthlySums.set(monthKey, (monthlySums.get(monthKey) ?? 0) + globalTilted)
   }
 
-  return ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12'].map(
-    (month) => ({
-      year: String(year),
-      month,
-      label: `${year}-${month}`,
-      irradiationJPerCm2: monthlySums.get(month) ?? 0,
-      irradiationKwhPerM2: (monthlySums.get(month) ?? 0) / 360,
-    })
-  )
+  return MONTH_KEYS.map((month) => ({
+    year: String(year),
+    month,
+    irradiationJPerCm2: monthlySums.get(month) ?? 0,
+    irradiationKwhPerM2: (monthlySums.get(month) ?? 0) * J_PER_CM2_TO_KWH_PER_M2,
+  }))
 }
 
 function recalculateTiltedSeries() {
-  if (latestHourlyRecords.length === 0) {
-    latestTiltedMonthlySeries = []
-    return
-  }
+  if (latestHourlyRecords.length === 0) { latestTiltedSeries = []; return }
 
-  latestTiltedMonthlySeries = aggregateTiltedMonthlyForYear(
+  latestTiltedSeries = aggregateTiltedMonthlyForYear(
     latestHourlyRecords,
     getSelectedComparisonYear(),
     latestSelectedLocation,
     Number(azimuthSliderEl.value),
-    Number(tiltSliderEl.value)
+    Number(tiltSliderEl.value),
   )
 }
 
-// -----------------------------------------------------------------------------
-// Chart helpers
-// -----------------------------------------------------------------------------
+// ── Chart helpers ─────────────────────────────────────────────────────────────
 
-// Extract the available years from the aggregated monthly time series.
-function getAvailableYears(monthlySeries) {
-  return Array.from(new Set(monthlySeries.map((entry) => entry.year))).sort((a, b) =>
-    a.localeCompare(b)
-  )
+const PLOTLY_BASE = {
+  paper_bgcolor: '#111827',
+  plot_bgcolor: '#111827',
+  font: { color: '#e5e7eb' },
+  margin: { t: 40, r: 20, b: 75, l: 75 },
+  xaxis: { gridcolor: '#374151', tickangle: 0, type: 'category', categoryorder: 'array', categoryarray: MONTH_LABELS },
+  yaxis: { gridcolor: '#374151' },
+  legend: { orientation: 'h', y: 1.14 },
 }
 
-// Fill the year dropdown while keeping the user's current selection if possible.
-function populateYearSelect(monthlySeries) {
-  const availableYears = getAvailableYears(monthlySeries)
-  const currentValue = yearSelectEl.value
-
-  yearSelectEl.innerHTML = availableYears
-    .map((year) => `<option value="${year}">${year}</option>`)
-    .join('')
-
-  if (currentValue && availableYears.includes(currentValue)) {
-    yearSelectEl.value = currentValue
-  } else if (availableYears.length > 0) {
-    yearSelectEl.value = availableYears[availableYears.length - 1]
-  }
+function getAvailableYears(series) {
+  return [...new Set(series.map((e) => e.year))].sort((a, b) => a.localeCompare(b))
 }
 
-// Compute which years should be shown based on the selected end year and range.
-function getSelectedYears(monthlySeries) {
-  const availableYears = getAvailableYears(monthlySeries)
-  const selectedYear = yearSelectEl.value
-  const selectedRange = Number(yearRangeSelectEl.value)
-
-  if (!selectedYear || Number.isNaN(selectedRange)) {
-    return []
-  }
-
-  const endIndex = availableYears.indexOf(selectedYear)
-
-  if (endIndex === -1) {
-    return []
-  }
-
-  const startIndex = Math.max(0, endIndex - selectedRange + 1)
-  return availableYears.slice(startIndex, endIndex + 1)
+function populateYearSelect(series) {
+  const years = getAvailableYears(series)
+  const prev  = yearSelectEl.value
+  yearSelectEl.innerHTML = years.map((y) => `<option value="${y}">${y}</option>`).join('')
+  yearSelectEl.value = years.includes(prev) ? prev : years.at(-1)
 }
 
-// Render the Plotly chart for the selected year comparison.
-function updateChartWithMonthlySeries(monthlySeries, stationName) {
-  // Persist the latest data so the chart can be redrawn when dropdown values change.
+function getSelectedYears(series) {
+  const years  = getAvailableYears(series)
+  const end    = yearSelectEl.value
+  const range  = Number(yearRangeSelectEl.value)
+  const endIdx = years.indexOf(end)
+  if (endIdx === -1 || Number.isNaN(range)) return []
+  return years.slice(Math.max(0, endIdx - range + 1), endIdx + 1)
+}
+
+function updateAnnualKpis(series) {
+  const annualSums = new Map()
+  for (const e of series) annualSums.set(e.year, (annualSums.get(e.year) ?? 0) + e.irradiationKwhPerM2)
+
+  const selectedSum = annualSums.get(yearSelectEl.value)
+  const values      = [...annualSums.values()]
+  const avg         = values.reduce((a, b) => a + b, 0) / values.length
+  const best        = Math.max(...values)
+  const bestYear    = [...annualSums.entries()].find(([, v]) => v === best)?.[0]
+
+  annualSelectedEl.textContent = selectedSum ? `${selectedSum.toFixed(0)} kWh/m²` : '–'
+  annualAvgEl.textContent      = `${avg.toFixed(0)} kWh/m²`
+  annualBestEl.textContent     = `${best.toFixed(0)} kWh/m² (${bestYear})`
+}
+
+function renderIrradianceChart(monthlySeries, stationName) {
   latestMonthlySeries = monthlySeries
-  latestStationName = stationName
+  latestStationName   = stationName
 
   populateYearSelect(monthlySeries)
+  updateAnnualKpis(monthlySeries)
 
-  // Determine which yearly curves should be shown in the comparison chart.
-  const selectedYears = getSelectedYears(monthlySeries)
-  const monthLabels = ['Jan', 'Feb', 'Mrz', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez']
-
-  // Build one Plotly trace per selected year using Jan-Dec as the common x-axis.
-  const traces = selectedYears.map((year) => {
-    const entriesForYear = monthlySeries.filter((entry) => entry.year === year)
-    const valuesByMonth = new Map(entriesForYear.map((entry) => [entry.month, entry]))
-
-    const yValues = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12'].map(
-      (month) => {
-        const entry = valuesByMonth.get(month)
-        return entry ? entry.irradiationKwhPerM2 : null
-      }
-    )
-
+  const traces = getSelectedYears(monthlySeries).map((year) => {
+    const byMonth = new Map(monthlySeries.filter((e) => e.year === year).map((e) => [e.month, e]))
     return {
-      x: monthLabels,
-      y: yValues,
+      x: MONTH_LABELS,
+      y: MONTH_KEYS.map((m) => byMonth.get(m)?.irradiationKwhPerM2 ?? null),
       type: 'scatter',
       mode: 'lines+markers',
       name: year,
@@ -552,197 +427,185 @@ function updateChartWithMonthlySeries(monthlySeries, stationName) {
     }
   })
 
-  Plotly.newPlot(
-    'chart',
+  Plotly.react(
+    'irradiance-chart',
     traces,
     {
+      ...PLOTLY_BASE,
       title: `Monatliche Globalstrahlung – ${stationName}`,
-      paper_bgcolor: '#111827',
-      plot_bgcolor: '#111827',
-      font: {
-        color: '#e5e7eb',
-      },
-      margin: {
-        t: 50,
-        r: 20,
-        b: 90,
-        l: 90,
-      },
-      xaxis: {
-        title: {
-          text: 'Monat',
-          standoff: 20,
-        },
-        type: 'category',
-        categoryorder: 'array',
-        categoryarray: monthLabels,
-        tickangle: 0,
-        gridcolor: '#374151',
-      },
-      yaxis: {
-        title: {
-          text: 'Monatliche Globalstrahlung (kWh/m²)',
-          standoff: 20,
-        },
-        gridcolor: '#374151',
-      },
-      legend: {
-        orientation: 'h',
-        y: 1.12,
-      },
+      yaxis: { ...PLOTLY_BASE.yaxis, title: { text: 'kWh/m²', standoff: 14 } },
     },
-    {
-      responsive: true,
-    }
+    { responsive: true },
   )
 }
 
-// -----------------------------------------------------------------------------
-// DWD fetch pipeline
-// -----------------------------------------------------------------------------
+function renderYieldChart() {
+  if (latestTiltedSeries.length === 0) return
 
-// Load a station ZIP file, parse the product file, and update the chart.
-async function testDwdZipFetch(zipUrl, stationName) {
+  const modulePower = Number(modulePowerInputEl.value)
+  const moduleArea  = Number(moduleAreaInputEl.value)
+  const moduleCount = Number(moduleCountInputEl.value)
+  if (!(modulePower > 0 && moduleArea > 0 && moduleCount > 0)) return
+
+  const efficiency  = modulePower / (1000 * moduleArea)
+  const totalArea   = moduleArea * moduleCount
+  const year        = latestTiltedSeries[0]?.year ?? ''
+  const monthlyKwh  = latestTiltedSeries.map((e) => e.irradiationKwhPerM2 * totalArea * efficiency)
+
+  yieldChartEl.classList.remove('yield-chart-empty')
+
+  Plotly.react(
+    'yield-chart',
+    [
+      {
+        x: MONTH_LABELS,
+        y: monthlyKwh,
+        type: 'bar',
+        marker: { color: '#2563eb' },
+        hovertemplate: '%{x}<br>%{y:.0f} kWh<extra></extra>',
+      },
+    ],
+    {
+      ...PLOTLY_BASE,
+      title: `Geschätzter Monatsertrag ${year}`,
+      yaxis: { ...PLOTLY_BASE.yaxis, title: { text: 'Ertrag (kWh)', standoff: 14 } },
+      showlegend: false,
+      bargap: 0.3,
+    },
+    { responsive: true },
+  )
+}
+
+// ── Yield KPIs ────────────────────────────────────────────────────────────────
+
+function updateYieldKpis() {
+  const modulePower      = Number(modulePowerInputEl.value)
+  const moduleArea       = Number(moduleAreaInputEl.value)
+  const moduleCount      = Number(moduleCountInputEl.value)
+  const electricityPrice = Number(electricityPriceInputEl.value)
+
+  const valid =
+    Number.isFinite(modulePower)      && modulePower > 0 &&
+    Number.isFinite(moduleArea)       && moduleArea > 0 &&
+    Number.isFinite(moduleCount)      && moduleCount > 0 &&
+    Number.isFinite(electricityPrice) && electricityPrice >= 0
+
+  if (!valid) {
+    for (const el of [moduleEfficiencyEl, estimatedYieldEl, annualEnergyYieldEl, annualRevenueEl]) {
+      el.textContent = '–'
+    }
+    return
+  }
+
+  const efficiency = modulePower / (1000 * moduleArea)
+  moduleEfficiencyEl.textContent = `${(efficiency * 100).toFixed(1)} %`
+
+  if (latestTiltedSeries.length === 0) {
+    estimatedYieldEl.textContent = annualEnergyYieldEl.textContent = annualRevenueEl.textContent = '–'
+    return
+  }
+
+  const annualIrradiation = latestTiltedSeries.reduce((s, e) => s + e.irradiationKwhPerM2, 0)
+  const annualEnergy      = annualIrradiation * moduleArea * moduleCount * efficiency
+  const annualRevenue     = annualEnergy * electricityPrice
+
+  estimatedYieldEl.textContent    = `${annualIrradiation.toFixed(1)} kWh/m²`
+  annualEnergyYieldEl.textContent = `${annualEnergy.toFixed(0)} kWh`
+  annualRevenueEl.textContent     = `${annualRevenue.toFixed(0)} €`
+}
+
+// ── DWD fetch ─────────────────────────────────────────────────────────────────
+
+async function loadStationData(zipUrl, stationName) {
+  setIrradianceChartState('loading')
   try {
     const response = await fetch(zipUrl)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-
-    const arrayBuffer = await response.arrayBuffer()
-    const zip = await JSZip.loadAsync(arrayBuffer)
-
-    const fileNames = Object.keys(zip.files)
-
-    const productFileName = fileNames.find((name) =>
-      name.startsWith('produkt_st_stunde_') && name.endsWith('.txt')
+    const zip = await JSZip.loadAsync(await response.arrayBuffer())
+    const productFileName = Object.keys(zip.files).find(
+      (n) => n.startsWith('produkt_st_stunde_') && n.endsWith('.txt'),
     )
+    if (!productFileName) throw new Error('Keine Produktdatei im ZIP')
 
-    if (!productFileName) {
-      throw new Error('Keine Produktdatei im ZIP gefunden')
-    }
+    const parsedRecords = parseDwdSolarProduct(await zip.files[productFileName].async('string'))
 
-    const productFile = zip.files[productFileName]
-    const productText = await productFile.async('string')
-
-    const parsedRecords = parseDwdSolarProduct(productText)
-
-    // Keep the full hourly time series in memory so the yield view can recompute
-    // tilted irradiation without reloading the DWD ZIP file.
     latestHourlyRecords = parsedRecords
     recalculateTiltedSeries()
+
     const monthlySeries = aggregateMonthlyIrradiation(parsedRecords)
-    updateChartWithMonthlySeries(monthlySeries, stationName)
-    updateYieldEstimation()
+    setIrradianceChartState('ready')
+    renderIrradianceChart(monthlySeries, stationName)
+    renderYieldChart()
+    updateYieldKpis()
   } catch (error) {
-    console.error('Fehler beim Laden der DWD-ZIP-Datei:', error)
+    console.error('DWD-Fetch-Fehler:', error)
+    setIrradianceChartState('error', `Daten konnten nicht geladen werden: ${error.message}`)
   }
 }
 
-// -----------------------------------------------------------------------------
-// App bootstrap and event listeners
-// -----------------------------------------------------------------------------
-
-// Load and parse the DWD solar station metadata file.
-async function testDwdStationMetadataFetch() {
+async function loadStationMetadata() {
   try {
     const response = await fetch(DWD_STATION_METADATA_URL)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-
-    const text = await response.text()
-
-    const lines = text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-
-    const dataLines = lines.slice(2)
-
-    // Parse the fixed-width-like station description file into station objects.
-    const parsedStations = dataLines.map((line) => {
+    const lines = (await response.text()).split('\n').map((l) => l.trim()).filter(Boolean)
+    dwdStations = lines.slice(2).map((line) => {
       const parts = line.split(/\s+/)
-
       return {
         stationId: parts[0],
-        fromDate: parts[1],
-        toDate: parts[2],
-        height: parts[3],
-        lat: Number(parts[4]),
-        lon: Number(parts[5]),
-        name: parts.slice(6, -1).join(' '),
-        state: parts[parts.length - 1],
+        fromDate:  parts[1],
+        toDate:    parts[2],
+        height:    parts[3],
+        lat:       Number(parts[4]),
+        lon:       Number(parts[5]),
+        name:      parts.slice(6, -1).join(' '),
+        state:     parts.at(-1),
       }
     })
-    dwdStations = parsedStations
   } catch (error) {
-    console.error('Fehler beim Laden der DWD-Stationsdatei:', error)
+    console.error('DWD-Metadaten-Fehler:', error)
+    setIrradianceChartState('error', 'DWD-Stationsliste konnte nicht geladen werden – bitte Seite neu laden.')
   }
 }
 
-// Initial app bootstrap: load station metadata first, then load the default location.
-testDwdStationMetadataFetch().then(() => {
-  updateLocationAndChart(
-    DEFAULT_LOCATION.lat,
-    DEFAULT_LOCATION.lon,
-    DEFAULT_LOCATION.name
-  )
+// ── Bootstrap + event listeners ───────────────────────────────────────────────
+
+loadStationMetadata().then(() => {
+  updateLocationAndChart(DEFAULT_LOCATION.lat, DEFAULT_LOCATION.lon, DEFAULT_LOCATION.name)
 })
 
-// User interaction: clicking the map selects a new location.
-map.on('click', async (event) => {
-  const { lat, lng } = event.latlng
-  await updateLocationAndChart(lat, lng)
-})
+map.on('click', ({ latlng: { lat, lng } }) => updateLocationAndChart(lat, lng))
 
-// Redraw the chart and recalculate tilted series when the selected end year changes.
 yearSelectEl.addEventListener('change', () => {
-  if (latestMonthlySeries.length > 0) {
-    updateChartWithMonthlySeries(latestMonthlySeries, latestStationName)
-  }
-
+  if (latestMonthlySeries.length > 0) renderIrradianceChart(latestMonthlySeries, latestStationName)
   recalculateTiltedSeries()
-  updateYieldEstimation()
+  renderYieldChart()
+  updateYieldKpis()
 })
 
-// Redraw the chart when the year range changes.
 yearRangeSelectEl.addEventListener('change', () => {
-  if (latestMonthlySeries.length > 0) {
-    updateChartWithMonthlySeries(latestMonthlySeries, latestStationName)
-  }
+  if (latestMonthlySeries.length > 0) renderIrradianceChart(latestMonthlySeries, latestStationName)
 })
 
-yieldButtonEl.addEventListener('click', () => {
-  showYieldView()
-})
-
-backButtonEl.addEventListener('click', () => {
-  showMainView()
-})
-
-modulePowerInputEl.addEventListener('input', () => {
-  updateYieldEstimation()
-})
-
-moduleAreaInputEl.addEventListener('input', () => {
-  updateYieldEstimation()
-})
-
-moduleCountInputEl.addEventListener('input', () => {
-  updateYieldEstimation()
-})
+const debouncedSliderUpdate = debounce(() => {
+  recalculateTiltedSeries()
+  renderYieldChart()
+  updateYieldKpis()
+}, 250)
 
 azimuthSliderEl.addEventListener('input', () => {
-  recalculateTiltedSeries()
-  updateYieldEstimation()
+  azimuthValueEl.textContent = `${azimuthSliderEl.value}°`
+  debouncedSliderUpdate()
 })
 
 tiltSliderEl.addEventListener('input', () => {
-  recalculateTiltedSeries()
-  updateYieldEstimation()
+  tiltValueEl.textContent = `${tiltSliderEl.value}°`
+  debouncedSliderUpdate()
 })
 
-updateYieldEstimation()
+for (const el of [modulePowerInputEl, moduleAreaInputEl, moduleCountInputEl, electricityPriceInputEl]) {
+  el.addEventListener('input', () => { renderYieldChart(); updateYieldKpis() })
+}
+
+updateYieldKpis()

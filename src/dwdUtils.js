@@ -1,3 +1,6 @@
+// 1 kWh/m² = 360 J/cm², so to convert J/cm² sums to kWh/m² multiply by this.
+export const J_PER_CM2_TO_KWH_PER_M2 = 1 / 360
+
 export function buildDwdSolarZipUrl(stationId) {
     const paddedStationId = stationId.toString().padStart(5, '0')
   
@@ -86,7 +89,7 @@ export function buildDwdSolarZipUrl(stationId) {
         month: yearMonth.slice(4, 6),
         label: `${yearMonth.slice(0, 4)}-${yearMonth.slice(4, 6)}`,
         irradiationJPerCm2: values.sum,
-        irradiationKwhPerM2: values.sum / 360,
+        irradiationKwhPerM2: values.sum * J_PER_CM2_TO_KWH_PER_M2,
         valueCount: values.count,
       }))
   }
