@@ -6,14 +6,20 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint . && prettier --check ."
   },
   "devDependencies": {
-    "vite": "^8.0.1"
+    "eslint": "^9.39.5",
+    "prettier": "^3.9.9",
+    "vite": "^8.0.1",
+    "vitest": "^3.2.7"
   },
   "dependencies": {
-    "jszip": "^3.10.1",
+    "fflate": "^0.8.3",
     "leaflet": "^1.9.4",
-    "plotly.js-dist-min": "^3.4.0"
+    "plotly.js-basic-dist-min": "^3.7.0"
   }
 }
